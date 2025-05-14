@@ -689,6 +689,7 @@ class TBATrainerGSM8K(Trainer):
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
                             mb_logprobs = logprobs[micro_batch_inds]
+                            mb_ref_logprobs = ref_logprobs[micro_batch_inds]
 
                             output = forward(model, mb_query_responses, tokenizer.pad_token_id)
                             logits = output.logits[:, context_length - 1 : -1]
@@ -697,6 +698,12 @@ class TBATrainerGSM8K(Trainer):
                             new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
+                            )
+                            mb_ref_logprobs = torch.masked_fill(
+                                mb_ref_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
+                            )
+                            mb_logprobs = torch.masked_fill(
+                                mb_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
 
                             # TB
@@ -724,15 +731,16 @@ class TBATrainerGSM8K(Trainer):
                                 pi_f = new_logprobs.sum(1)
                                 log_Z_pred = ((-pi_f + p_ref_f[micro_batch_inds]) + scores[micro_batch_inds]/args.kl_coef).view(args.rloo_k, -1)[:logZ_k_size].mean(0).repeat(args.rloo_k).detach()
                                 tb_loss = ((log_Z_pred + (pi_f - p_ref_f[micro_batch_inds]) - scores[micro_batch_start:micro_batch_end]/args.kl_coef)**2).mean().detach()
-                                per_token_kl = (torch.exp(ref_logprobs - new_logprobs) - (ref_logprobs - new_logprobs) - 1).sum(1)
+                                per_token_kl = (torch.exp(mb_ref_logprobs - new_logprobs) - (mb_ref_logprobs - new_logprobs) - 1).sum(1)
                                 new_ratio = (new_logprobs - mb_logprobs).exp()
-                                new_logprobs = new_logprobs.sum(1)
-                                mb_logprobs = mb_logprobs.sum(1)
+                                new_logprobs = new_logprobs#.sum(1)
+                                mb_logprobs = mb_logprobs#.sum(1)
                                 logprobs_diff = new_logprobs - mb_logprobs
+                                mb_advantage = ((scores[micro_batch_inds] - scores[micro_batch_inds].mean())/(scores[micro_batch_inds].std() + 1e-6)).view(-1,1)
                                 ratio = torch.exp(logprobs_diff)
                                 pg_losses = -mb_advantage * ratio
                                 pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
-                                pg_loss_max = torch.max(pg_losses, pg_losses2) + args.kl_coef * per_token_kl
+                                pg_loss_max = torch.max(pg_losses, pg_losses2).sum(1) + args.kl_coef * per_token_kl
                                 pg_loss = pg_loss_max.mean()
                                 accelerator.backward(pg_loss)
                                 optimizer.step()
