@@ -79,6 +79,7 @@ class TBAConfigGSM8K(RLOOConfig):
     warmup_ratio: float = 0.05
     WSD_decay_steps: int = 500
     WSD_stable_steps: int = 450
+    loss_type: str = "grpo"
 
 class TBATrainerGSM8K(Trainer):
     def __init__(
@@ -699,27 +700,44 @@ class TBATrainerGSM8K(Trainer):
                             )
 
                             # TB
-                            p_ref_f = ref_logprobs.sum(1)
-                            pi_f = new_logprobs.sum(1)
-                            log_Z_pred = ((-pi_f + p_ref_f[micro_batch_inds]) + scores[micro_batch_inds]/args.kl_coef).view(args.rloo_k, -1)[:logZ_k_size].mean(0).repeat(args.rloo_k).detach()
-                            tb_loss = ((log_Z_pred + (pi_f - p_ref_f[micro_batch_inds]) - scores[micro_batch_start:micro_batch_end]/args.kl_coef)**2).mean()
-                            accelerator.backward(tb_loss)
-                            optimizer.step()
-                            optimizer.zero_grad()
+                            if args.loss_type == 'tba':
+                                p_ref_f = ref_logprobs.sum(1)
+                                pi_f = new_logprobs.sum(1)
+                                log_Z_pred = ((-pi_f + p_ref_f[micro_batch_inds]) + scores[micro_batch_inds]/args.kl_coef).view(args.rloo_k, -1)[:logZ_k_size].mean(0).repeat(args.rloo_k).detach()
+                                tb_loss = ((log_Z_pred + (pi_f - p_ref_f[micro_batch_inds]) - scores[micro_batch_start:micro_batch_end]/args.kl_coef)**2).mean()
+                                accelerator.backward(tb_loss)
+                                optimizer.step()
+                                optimizer.zero_grad()
 
-                            new_ratio = (new_logprobs - mb_logprobs).exp()
-                            new_logprobs = new_logprobs.sum(1)
-                            mb_logprobs = mb_logprobs.sum(1)
-                            logprobs_diff = new_logprobs - mb_logprobs
-                            ratio = torch.exp(logprobs_diff)
-                            pg_losses = -mb_advantage * ratio
-                            pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
-                            pg_loss_max = torch.max(pg_losses, pg_losses2)
-                            pg_loss = pg_loss_max.mean()
-                            #loss = pg_loss
-                            #accelerator.backward(loss)
-                            #optimizer.step()
-                            #optimizer.zero_grad()
+                                new_ratio = (new_logprobs - mb_logprobs).exp()
+                                new_logprobs = new_logprobs.sum(1)
+                                mb_logprobs = mb_logprobs.sum(1)
+                                logprobs_diff = new_logprobs - mb_logprobs
+                                ratio = torch.exp(logprobs_diff)
+                                pg_losses = -mb_advantage * ratio
+                                pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+                                pg_loss_max = torch.max(pg_losses, pg_losses2)
+                                pg_loss = pg_loss_max.mean()
+                            
+                            elif args.loss_type == 'grpo':
+                                p_ref_f = ref_logprobs.sum(1)
+                                pi_f = new_logprobs.sum(1)
+                                log_Z_pred = ((-pi_f + p_ref_f[micro_batch_inds]) + scores[micro_batch_inds]/args.kl_coef).view(args.rloo_k, -1)[:logZ_k_size].mean(0).repeat(args.rloo_k).detach()
+                                tb_loss = ((log_Z_pred + (pi_f - p_ref_f[micro_batch_inds]) - scores[micro_batch_start:micro_batch_end]/args.kl_coef)**2).mean().detach()
+                                per_token_kl = (torch.exp(ref_logprobs - new_logprobs) - (ref_logprobs - new_logprobs) - 1).sum(1)
+                                new_ratio = (new_logprobs - mb_logprobs).exp()
+                                new_logprobs = new_logprobs.sum(1)
+                                mb_logprobs = mb_logprobs.sum(1)
+                                logprobs_diff = new_logprobs - mb_logprobs
+                                ratio = torch.exp(logprobs_diff)
+                                pg_losses = -mb_advantage * ratio
+                                pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+                                pg_loss_max = torch.max(pg_losses, pg_losses2) + args.kl_coef * per_token_kl
+                                pg_loss = pg_loss_max.mean()
+                                accelerator.backward(pg_loss)
+                                optimizer.step()
+                                optimizer.zero_grad()
+
                             with torch.no_grad():
                                 pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)

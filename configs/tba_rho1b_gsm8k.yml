@@ -21,3 +21,4 @@ save_steps: 0.25
 hub_strategy: all_checkpoints
 logging_steps: 100
 num_sample_generations: 0
+loss_type: grpo # [grpo, tba]
