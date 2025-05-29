@@ -26,21 +26,27 @@ class ScriptArguments:
     max_length: int = field(default=256, metadata={"help": "The maximum sequence length for SFT Trainer"})
     config: str = field(default=None, metadata={"help": "Path to the optional config file"})
     wandb_run_id: Optional[str] = field(default=None)
-
+    use_deepspeed: bool = field(default=False, metadata={"help": "Use DeepSpeed via plugin"})
 
 if __name__ == "__main__":
     # prevent accelerate from joining all processes -- see init_distributed_env for details
+    accelerate_ranks = [0, 1]  # Changed from [0] to [0, 1] for multi-GPU training
+    
     comm, comm_world_rank, comm_world_size, accelerator = init_distributed_env(
-            accelerate_ranks=[0]
+        accelerate_ranks=accelerate_ranks,
+        accelerate_kwargs={
+        }
     )
-    print(f'Before trainer created, reporting from rank {comm_world_rank} of {comm_world_size}', flush=True)
-    parser = TRLParser((ScriptArguments, TBAConfigGSM8K, ModelConfig))
-    args, config, model_config = parser.parse_args_and_config()
-        
 
+    parser = TRLParser((ScriptArguments, TBAConfigGSM8K, ModelConfig))
+    print(comm_world_rank, flush=True)
+    args, config, model_config = parser.parse_args_and_config()
+    config.use_deepspeed = args.use_deepspeed
+    
+    print(f'Before trainer created, reporting from rank {comm_world_rank} of {comm_world_size}', flush=True)
+    
     if args.output_global_parent_dir is not None:
         config.output_dir = os.path.join(args.output_global_parent_dir, config.output_dir)
-
 
     ################
     # Model & Tokenizer
@@ -73,21 +79,15 @@ if __name__ == "__main__":
     train_dataset = prepare_dataset(train_dataset, tokenizer)
     eval_dataset = prepare_dataset(eval_dataset, tokenizer)
 
-    #print(f'Before filtering have lengths train {len(train_dataset)}, test {len(eval_dataset)}', flush=True)
     print('max dataset length is ', max([x['lengths'] for x in train_dataset]),
           '\nargs.max_length is ', args.max_length, flush=True)
     assert max([x['lengths'] for x in train_dataset])<=args.max_length, max([x['lengths'] for x in train_dataset])
     assert max([x['lengths'] for x in eval_dataset])<=args.max_length, max([x['lengths'] for x in eval_dataset])
-    # filtering should be a no-op given the asserts pass
-    #train_dataset = train_dataset.filter(lambda x: x["lengths"] <= args.max_length)
-    #eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= args.max_length)
-    #print(f'After filtering have lengths train {len(train_dataset)}, test {len(eval_dataset)}', flush=True)
     assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
 
     ################
     # Training
     ################
-
     TrainerCls = TBATrainerGSM8K
 
     trainer = TrainerCls(

@@ -1,69 +1,104 @@
 import os
 import socket
 from mpi4py import MPI
-from accelerate import Accelerator
 import torch
 
-def next_free_port( port=1024, max_port=65535 ):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    while port <= max_port:
-        try:
-            sock.bind(('', port))
-            sock.close()
-            return port
-        except OSError:
-            port += 1
-    raise IOError('no free ports')
-    
 def init_distributed_env(accelerate_ranks=None, accelerate_kwargs=None):
     """
     - Initializes MPI.
-    - Optionally configures environment variables so that the ranks
-      in `accelerate_ranks` can form a smaller "Accelerate world."
+    - Configures environment variables so that the ranks in `accelerate_ranks` 
+      can form a smaller "Accelerate world" for multi-GPU training.
     - Returns:
         comm, world_rank, world_size, accelerator
     """
+    from accelerate import Accelerator
+    
     if accelerate_kwargs is None:
         accelerate_kwargs = {}
+        
     comm = MPI.COMM_WORLD
     world_rank = comm.Get_rank()
     world_size = comm.Get_size()
-
+    
     if accelerate_ranks is None:
-        # Default: only rank 0 will use Accelerate
         accelerate_ranks = [0]
-
-    # Broadcast a common MASTER_ADDR from rank 0
+    
+    # Ensure accelerate_ranks is sorted for consistent indexing
+    accelerate_ranks = sorted(accelerate_ranks)
+    
+    # Rank 0 determines master address and port, then broadcasts to all
     if world_rank == 0:
         assert world_rank in accelerate_ranks, "Rank 0 must be in accelerate ranks"
         master_addr = socket.gethostname()
-        # TODO: broadcast a port+addr for the case with multiple accelerate_ranks?
-    elif world_rank not in accelerate_ranks:
-        # i think this helps prevent accelerate from joining all processes
-        os.environ["WORLD_SIZE"] = str(1)
-        os.environ["RANK"] = str(0)
-        os.environ["LOCAL_RANK"] = str(0)
-        os.environ["MASTER_ADDR"] = socket.gethostname()
-        os.environ["MASTER_PORT"] = f"{next_free_port(29500+world_rank*10)}"  # pick an unused port
-
+        master_port = next_free_port(29500)  # Use same port for all accelerate ranks
+        coordination_info = {'master_addr': master_addr, 'master_port': master_port}
+    else:
+        coordination_info = None
+    
+    # Broadcast coordination info to all ranks
+    coordination_info = comm.bcast(coordination_info, root=0)
+    master_addr = coordination_info['master_addr']
+    master_port = coordination_info['master_port']
+    
     accelerator = None
+    
     if world_rank in accelerate_ranks:
-        # TODO: modify/test this for more than just 1 accelerator rank 
+        # Configure environment for accelerate ranks
         local_accel_rank = accelerate_ranks.index(world_rank)
-
+        local_rank = local_accel_rank  # For multi-GPU: rank 0->GPU 0, rank 1->GPU 1, etc.
+        
+        # Set up distributed training environment variables
         os.environ["WORLD_SIZE"] = str(len(accelerate_ranks))
         os.environ["RANK"] = str(local_accel_rank)
-        os.environ["LOCAL_RANK"] = str(local_accel_rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
         os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = f"{next_free_port(29500+world_rank*10)}"  # pick an unused port
-
-        # Create the Accelerator only on these sub-world ranks
-        accelerator = Accelerator(**accelerate_kwargs)
-
+        os.environ["MASTER_PORT"] = str(master_port)
+        
+        print(f"Accelerate rank {world_rank}: WORLD_SIZE={len(accelerate_ranks)}, "
+              f"RANK={local_accel_rank}, LOCAL_RANK={local_rank}, "
+              f"MASTER_ADDR={master_addr}, MASTER_PORT={master_port}", flush=True)
+        
+        # Create the Accelerator for this rank
+        try:
+            accelerator = Accelerator(**accelerate_kwargs)
+            print(f"Accelerator created successfully for rank {world_rank}", flush=True)
+        except Exception as e:
+            print(f"Failed to create accelerator for rank {world_rank}: {e}", flush=True)
+            raise
+            
+    else:
+        # Configure environment for non-accelerate ranks (searchers)
+        # Isolate them from the accelerate world
+        searcher_rank = world_rank - len(accelerate_ranks)  # 0-indexed among searchers
+        isolated_port = next_free_port(30000 + searcher_rank * 10)  # Different port range
+        
+        os.environ["WORLD_SIZE"] = "1"  # Each searcher is in its own "world"
+        os.environ["RANK"] = "0" 
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["MASTER_ADDR"] =  socket.gethostname() #master_addr  # Can use same addr
+        os.environ["MASTER_PORT"] = str(isolated_port)  # But different port
+        
+        print(f"Searcher rank {world_rank}: Isolated from accelerate world, "
+              f"using port {isolated_port}", flush=True)
+    
     return comm, world_rank, world_size, accelerator
 
+def next_free_port(start_port=29500):
+    """Find the next available port starting from start_port"""
+    import socket
+    
+    for port in range(start_port, start_port + 100):  # Try 100 ports
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('localhost', port))
+                return port
+        except OSError:
+            continue
+    
+    raise RuntimeError(f"Could not find free port starting from {start_port}")
 
-def broadcast_weights(model, comm: MPI.Comm, root_mpi_rank: int):
+
+def broadcast_weights(model, comm: MPI.Comm, root_mpi_rank: int, role: str):
     """
     Broadcast all of `model`'s parameters from `root_mpi_rank`
     to every other MPI rank. If you're running on GPU,
@@ -78,7 +113,7 @@ def broadcast_weights(model, comm: MPI.Comm, root_mpi_rank: int):
         # Broadcast in-place from root
         comm.Bcast(param_cpu, root=root_mpi_rank)
         # Non-root ranks copy data back into model param
-        if world_rank != root_mpi_rank:
+        if world_rank != root_mpi_rank and role!= 'trainer':
             # Convert back to original dtype and device
             param.data = torch.from_numpy(param_cpu).to(
                 dtype=param.data.dtype,

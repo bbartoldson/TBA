@@ -115,11 +115,15 @@ class TBATrainerGSM8K(Trainer):
         ###########################
         #### Distributed Setup ####
         ###########################
-        accelerate_ranks = [0] # haven't tested multi-GPU trainers, but should be possible with [0,1] (e.g.)
+        accelerate_ranks = [0, 1] # haven't tested multi-GPU trainers, but should be possible with [0,1] (e.g.)
+        accelerate_kwargs={
+                            'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        }
+        if args.use_deepspeed:
+            accelerate_kwargs.update( {'deepspeed_plugin': self.create_deepspeed_plugin(len(accelerate_ranks))} )
         self.comm, self.comm_world_rank, self.comm_world_size, self.accelerator = init_distributed_env(
             accelerate_ranks=accelerate_ranks, 
-            accelerate_kwargs={'gradient_accumulation_steps': args.gradient_accumulation_steps
-            }
+            accelerate_kwargs=accelerate_kwargs
         )
         if self.comm_world_rank == 0:
             print(f"""Trainer configuration:
@@ -142,11 +146,12 @@ class TBATrainerGSM8K(Trainer):
         print(f'In trainer init, {self.role} reporting from rank {self.comm_world_rank} of {self.comm_world_size}',
               flush=True)
         self.n_searchers = self.comm_world_size - len(accelerate_ranks)
+        self.n_trainers = len(accelerate_ranks)
         # Create the local subset dataset for this rank, assigning it a subset of comment IDs (CIDs)
         #print('RUNNING WITH LIMITED DATASET IN DEBUG MODE!!!')
         #limit = 10000 # remove this limit to stop debug mode
         if self.role=='trainer':
-            my_cids = list(range(len(train_dataset)))#[:limit]
+            my_cids = list(range(len(train_dataset))) # keep as is for multi-gpu as trainer only samples what searcher sends it anyway
         else:
             cid_splits = split_dataset_indices(len(train_dataset), self.n_searchers) #split_dataset_indices(limit, self.n_searchers)
             my_cids = cid_splits[self.comm_world_rank-len(accelerate_ranks)]
@@ -247,7 +252,8 @@ class TBATrainerGSM8K(Trainer):
                 self.lr_scheduler,
             )
             self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
-            self.control = TrainerControl()
+            if self.comm_world_rank==0:
+                self.control = TrainerControl()
     
             self.current_flos = 0
             self.hp_search_backend = None
@@ -279,7 +285,7 @@ class TBATrainerGSM8K(Trainer):
                 drop_last=False,
                 shuffle=False,
             )  # no need to shuffle eval dataset
-            self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
+            #self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
     
             del self.ref_policy # not used by the trainer
                 
@@ -393,7 +399,9 @@ class TBATrainerGSM8K(Trainer):
         
         if self.role == 'trainer':
             self.generate_completions(sampling=True, init=True)
+
             self.trainer_loop()
+
             self.evaluate()
         else:
             self.searcher_loop()
@@ -652,8 +660,9 @@ class TBATrainerGSM8K(Trainer):
             else:
                 self.state.save_steps = args.save_steps
 
-        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
-        wandb.log(self.init_table)
+        if self.accelerator.process_index == 0:
+            self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+            wandb.log(self.init_table)
         for update in range(1, self.num_batches + 1):
             if args.kl_anneal:
                 if update < args.kl_coef_decay_stop_iter:
@@ -665,12 +674,13 @@ class TBATrainerGSM8K(Trainer):
             self.lr_scheduler.step()
                 
             if self.trainer_iteration<=self.max_sync_iteration:
-                for w in range(self.comm_world_size-self.n_searchers, self.comm_world_size):
-                    self.comm.isend(self.trainer_iteration, dest=w)
+                if self.comm_world_rank == 0:
+                    for w in range(self.comm_world_size-self.n_searchers, self.comm_world_size):
+                        self.comm.isend(self.trainer_iteration, dest=w)
             
             (responses, sequence_lengths, advantages, logprobs,
              ref_logprobs, scores, query_responses, context_length,
-             padding_mask, kl, non_score_reward, rlhf_reward) = self.get_batch_from_buffer(args.batch_size)
+             padding_mask, kl, non_score_reward, rlhf_reward) = self.get_batch_from_buffer(args.local_batch_size)
             
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             for ppo_epoch_idx in range(args.num_ppo_epochs):
@@ -735,10 +745,11 @@ class TBATrainerGSM8K(Trainer):
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     self.state.global_step += 1
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                    if self.control.should_save:
-                        self._save_checkpoint(model, trial=None, metrics=None)
-                        self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                    if self.comm_world_rank==0:
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        if self.control.should_save:
+                            self._save_checkpoint(model, trial=None, metrics=None)
+                            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
                     # del everything and empty cache
                     # fmt: off
                     del (
@@ -776,7 +787,8 @@ class TBATrainerGSM8K(Trainer):
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
                 self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
-                self.log(metrics)
+                if self.comm_world_rank==0:
+                    self.log(metrics)
             del kl, mean_kl, mean_entropy, scores
             torch.cuda.empty_cache()
             gc.collect()
@@ -791,10 +803,11 @@ class TBATrainerGSM8K(Trainer):
                     self.trainer_iteration, flush=True
                 )
 
-        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-        if self.control.should_save:
-            self._save_checkpoint(model, trial=None, metrics=metrics)
-            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+        if self.comm_world_rank==0:
+            self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+            if self.control.should_save:
+                self._save_checkpoint(model, trial=None, metrics=metrics)
+                self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def generate_completions(self, sampling: bool = False, init=False):
         self.model.eval()
@@ -810,6 +823,7 @@ class TBATrainerGSM8K(Trainer):
         table = defaultdict(list)
 
         for i, batch in enumerate(self.eval_dataloader):
+            print(f'rank {self.comm_world_rank} has batch {i} with {len(batch["input_ids"])} elements',flush=True)
             
             query = batch["input_ids"].cuda()
             response_d = batch["response_ids"].cuda()
@@ -832,15 +846,14 @@ class TBATrainerGSM8K(Trainer):
                 score = (self.grade_answer(response_value, ground_truth)).squeeze(1) # binary_RM
                 scores.append(score.sum().cpu().item())
                 if i == 0:
-                    table["query"].extend(gather_object(tokenizer.batch_decode(query)))
-                    table["model response"].extend(gather_object(tokenizer.batch_decode(response)))
-                    table["model response value"].extend(self.accelerator.gather(response_value.squeeze()).float().cpu().numpy())
-                    table["test acc approx"].extend(self.accelerator.gather(score).float().cpu().numpy())
+                    table["query"].extend(tokenizer.batch_decode(query))
+                    table["model response"].extend(tokenizer.batch_decode(response))
+                    table["model response value"].extend(response_value.squeeze().float().cpu().numpy())
+                    table["test acc approx"].extend(score.float().cpu().numpy())
                 
-        self.model.train()
         
-        df = pd.DataFrame(table)
-        if self.accelerator.process_index == 0:
+        if self.comm_world_rank==0:
+            df = pd.DataFrame(table)
             print_rich_table(df.iloc[0 : 0 + 5])
             if init:
                 self.init_table = {"completion_table": wandb.Table(dataframe=df)}
@@ -889,7 +902,7 @@ class TBATrainerGSM8K(Trainer):
             include_stop_str_in_output=True,
             stop_token_ids=[self.tokenizer.eos_token_id]
         )
-        
+      
         llm = LLM(
             model=model_name_or_path,
             revision="main",
@@ -961,31 +974,34 @@ class TBATrainerGSM8K(Trainer):
             
         if self.role=='trainer':
             # Gather from workers
-            updated_data = {}
-            gathered = self.comm.gather(updated_data, root=0)  # blocking gather
-            for searcher_dict in gathered:
+            for corresponding_searcher in range(self.n_trainers+self.comm_world_rank, self.comm_world_size, self.n_trainers):
+                searcher_dict = self.comm.recv(source=corresponding_searcher)
                 for cid in searcher_dict:
+                    print(f'Trainer rank {self.comm_world_rank} received CID {cid} on iter {self.trainer_iteration}', flush=True)
                     self.comment_buffer_manager.overwrite_cid_buffer(
                         cid,
                         searcher_dict[cid],
                         self.trainer_iteration
                     )
         else:
+            corresponding_trainer = (self.comm_world_rank-self.n_trainers) % self.n_trainers
             updated_data = {}
             for cid in self.changed_cids:
+                print(f'Searcher rank {self.comm_world_rank} sent CID {cid} on iter {self.trainer_iteration}', flush=True)
                 # We send the entire CommentBuffer object
                 updated_data[cid] = self.comment_buffer_manager.comment_buffers[cid]
-            gathered = self.comm.gather(updated_data, root=0)  # blocking
+            self.comm.send(updated_data, dest=corresponding_trainer)
             self.synced_iterations.add(self.trainer_iteration)
             self.changed_cids = set()
 
     def sync_weights(self):
         self.comm.barrier()
         start = time.time()
-        broadcast_weights(self.model, self.comm, root_mpi_rank=0)
         if self.role=='trainer':
+            broadcast_weights(self.model, self.comm, root_mpi_rank=0, role=self.role)
             print(f"broadcast weights took: {time.time() - start:.2f} seconds", flush=True)
         else:
+            broadcast_weights(self.model, self.comm, root_mpi_rank=0, role=self.role)
             llmp = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
             llmp.load_weights(self.model.named_parameters())
             print('Loaded updated parameters into vLLM engine')
@@ -997,15 +1013,15 @@ class TBATrainerGSM8K(Trainer):
         # get and unpack buffer data
         #start_data = time.time()
         buffer_data, query_IDs = self.comment_buffer_manager.get_batch(batch_size)
-        responses = buffer_data['responses'].cuda()
-        advantages = buffer_data['advantages'].cuda()
-        scores = buffer_data['scores'].cuda()
-        logprobs = buffer_data['logprobs'].cuda()
-        ref_logprobs = buffer_data['ref_logprobs'].cuda()
-        sequence_lengths = buffer_data['sequence_lengths'].cuda()
+        responses = buffer_data['responses'].to(self.accelerator.device)
+        advantages = buffer_data['advantages'].to(self.accelerator.device)
+        scores = buffer_data['scores'].to(self.accelerator.device)
+        logprobs = buffer_data['logprobs'].to(self.accelerator.device)
+        ref_logprobs = buffer_data['ref_logprobs'].to(self.accelerator.device)
+        sequence_lengths = buffer_data['sequence_lengths'].to(self.accelerator.device)
         
         # get full, padded queries from their keys
-        queries = self.data_collator([self.train_dataset[i] for i in query_IDs])['input_ids'].cuda()
+        queries = self.data_collator([self.train_dataset[i] for i in query_IDs])['input_ids'].to(self.accelerator.device)
         queries = queries.repeat_interleave(args.rloo_k, dim=0, output_size=args.rloo_k*len(query_IDs))
         context_length = queries.shape[1]
         
@@ -1025,3 +1041,25 @@ class TBATrainerGSM8K(Trainer):
                     scores, query_responses, context_length, padding_mask,
                     kl, non_score_reward, rlhf_reward
                )
+
+    def create_deepspeed_plugin(self, n_trainers):
+        from accelerate.utils import DeepSpeedPlugin
+        
+        args = self.args
+
+        deepspeed_plugin = DeepSpeedPlugin(
+            zero_stage=2,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            gradient_clipping=1.0
+        )
+        kwargs = {
+            "bf16.enabled": True,
+            "fp16.enabled": False,
+            "train_micro_batch_size_per_gpu": args.per_device_train_batch_size,
+            "train_batch_size": args.per_device_train_batch_size * 
+                                args.gradient_accumulation_steps *
+                                n_trainers
+        }
+        deepspeed_plugin.deepspeed_config_process(**kwargs)
+        print(deepspeed_plugin, flush=True)
+        return deepspeed_plugin
