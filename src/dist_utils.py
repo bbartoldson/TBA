@@ -2,6 +2,7 @@ import os
 import socket
 from mpi4py import MPI
 import torch
+import cupy
 
 def init_distributed_env(accelerate_ranks=None, accelerate_kwargs=None):
     """
@@ -98,7 +99,7 @@ def next_free_port(start_port=29500):
     raise RuntimeError(f"Could not find free port starting from {start_port}")
 
 
-def broadcast_weights(model, comm: MPI.Comm, root_mpi_rank: int, role: str):
+def broadcast_weights_orig(model, comm: MPI.Comm, root_mpi_rank: int, role: str):
     """
     Broadcast all of `model`'s parameters from `root_mpi_rank`
     to every other MPI rank. If you're running on GPU,
@@ -119,3 +120,87 @@ def broadcast_weights(model, comm: MPI.Comm, root_mpi_rank: int, role: str):
                 dtype=param.data.dtype,
                 device=param.data.device
             )
+
+
+import torch
+import pickle
+import os
+from pathlib import Path
+import time
+
+def broadcast_weights(model, comm, root_mpi_rank, role ):
+    """
+    Broadcast weights via Lustre filesystem.
+    Requires proper Lustre striping for best performance.
+    """
+    lustre_path = '/p/lustre5/bartolds/tmp'
+    rank = comm.Get_rank()
+    world_size = comm.Get_size() 
+    root_rank = root_mpi_rank
+
+    lustre_dir = Path(lustre_path)
+    lustre_dir.mkdir(exist_ok=True)
+    
+    # Use unique identifiers to avoid conflicts
+    job_id = os.environ.get('SLURM_JOB_ID', str(os.getpid()))
+    weights_file = lustre_dir / f"weights_{job_id}_{rank}.pt"
+    ready_file = lustre_dir / f"ready_{job_id}"
+
+
+    job_id = os.environ.get('SLURM_JOB_ID', str(os.getpid()))
+    weights_file = lustre_dir / f"weights_{job_id}.pt"
+    ready_file = lustre_dir / f"ready_{job_id}"
+    
+    try:
+        if rank == root_rank:
+            print(f"[rank {rank}] Writing weights...")
+            
+            # Save as a list of tensors to avoid name mismatches
+            param_list = [param.cpu().clone() for param in model.parameters()]
+            torch.save(param_list, weights_file)
+            
+            # Force file system sync
+            os.sync()
+            time.sleep(0.1)
+            ready_file.touch()
+            os.sync()
+            
+            print(f"[rank {rank}] Weights written")
+        
+        # All ranks wait
+        comm.Barrier()
+        
+        if role!='trainer':
+            print(f"[rank {rank}] Waiting for weights...")
+            
+            # Wait for ready signal
+            timeout = 60
+            start_time = time.time()
+            
+            while not ready_file.exists():
+                if time.time() - start_time > timeout:
+                    raise TimeoutError(f"Rank {rank}: Timeout waiting for weights file")
+                time.sleep(0.1)
+            
+            print(f"[rank {rank}] Loading weights...")
+            
+            # Load weights as list
+            param_list = torch.load(weights_file, map_location='cpu')
+            
+            # Copy parameters in order (avoiding name issues)
+            for param, saved_param in zip(model.parameters(), param_list):
+                param.data.copy_(saved_param.to(param.device))
+            
+            print(f"[rank {rank}] Weights loaded")
+        
+        # Final barrier
+        comm.Barrier()
+        
+    finally:
+        # Cleanup
+        if rank == root_rank:
+            try:
+                weights_file.unlink(missing_ok=True)
+                ready_file.unlink(missing_ok=True)
+            except:
+                pass

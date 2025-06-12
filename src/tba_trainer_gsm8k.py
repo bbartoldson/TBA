@@ -252,8 +252,8 @@ class TBATrainerGSM8K(Trainer):
                 self.lr_scheduler,
             )
             self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
-            if self.comm_world_rank==0:
-                self.control = TrainerControl()
+            #if self.comm_world_rank==0:
+            self.control = TrainerControl()
     
             self.current_flos = 0
             self.hp_search_backend = None
@@ -335,6 +335,9 @@ class TBATrainerGSM8K(Trainer):
         self.max_sync_iteration = sync_interval * ((self.num_batches  + sync_interval - 1) // sync_interval - 1)
         self.initial_buffer_samples = args.initial_buffer_samples
         self.args.kl_coef_original = self.args.kl_coef
+        #TODO, we shouldn't have to set these manually. might need to pass deepspeed to parser
+        # see https://github.com/huggingface/transformers/blob/main/src/transformers/training_args.py#L2012
+        self.model_wrapped=self.deepspeed=self.model
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
@@ -660,8 +663,8 @@ class TBATrainerGSM8K(Trainer):
             else:
                 self.state.save_steps = args.save_steps
 
+        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
         if self.accelerator.process_index == 0:
-            self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
             wandb.log(self.init_table)
         for update in range(1, self.num_batches + 1):
             if args.kl_anneal:
@@ -745,11 +748,13 @@ class TBATrainerGSM8K(Trainer):
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     self.state.global_step += 1
-                    if self.comm_world_rank==0:
-                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                        if self.control.should_save:
-                            self._save_checkpoint(model, trial=None, metrics=None)
-                            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                    #time.sleep(12)
+                    #if self.comm_world_rank==0:
+                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                    if self.control.should_save:
+                        print(f'rank {self.comm_world_rank} is SAVING!!!')
+                        self._save_checkpoint(model, trial=None, metrics=None)
+                        self.control = self.callback_handler.on_save(self.args, self.state, self.control)
                     # del everything and empty cache
                     # fmt: off
                     del (
@@ -803,13 +808,18 @@ class TBATrainerGSM8K(Trainer):
                     self.trainer_iteration, flush=True
                 )
 
-        if self.comm_world_rank==0:
-            self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-            if self.control.should_save:
-                self._save_checkpoint(model, trial=None, metrics=metrics)
-                self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+        #if self.comm_world_rank==0:
+        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+        if self.control.should_save:
+            print(f'rank {self.comm_world_rank} is SAVING!!!')
+            self._save_checkpoint(model, trial=None, metrics=metrics)
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def generate_completions(self, sampling: bool = False, init=False):
+        '''
+        self.init_table = {"completion_table": None}
+        return
+        '''
         self.model.eval()
         args = self.args
         tokenizer = self.tokenizer
@@ -1043,10 +1053,23 @@ class TBATrainerGSM8K(Trainer):
                )
 
     def create_deepspeed_plugin(self, n_trainers):
-        from accelerate.utils import DeepSpeedPlugin
-        
         args = self.args
 
+        from accelerate.utils import DeepSpeedPlugin
+        from accelerate.utils.deepspeed import HfDeepSpeedConfig
+        config = {
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "zero_optimization": {"stage": 2},
+                "bf16.enabled": True,
+                "fp16.enabled": False,
+                "train_micro_batch_size_per_gpu": args.per_device_train_batch_size,
+                "train_batch_size": args.per_device_train_batch_size * 
+                                    args.gradient_accumulation_steps *
+                                    n_trainers
+        }
+        config = HfDeepSpeedConfig(config)
+        deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=config)
+        '''
         deepspeed_plugin = DeepSpeedPlugin(
             zero_stage=2,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -1061,5 +1084,8 @@ class TBATrainerGSM8K(Trainer):
                                 n_trainers
         }
         deepspeed_plugin.deepspeed_config_process(**kwargs)
+        '''
         print(deepspeed_plugin, flush=True)
+
+        
         return deepspeed_plugin

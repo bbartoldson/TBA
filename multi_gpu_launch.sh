@@ -6,13 +6,13 @@ config="multi_gpu_tba_rho1b_gsm8k"
 num_trainer_processes=2 # this is hard-coded. changing it requires changes to visible devices and the python code.
 
 num_processes=4  # 2 trainers + 2 searchers
-#num_processes=8  # 2 trainers + 6 searchers
+num_processes=8  # 2 trainers + 6 searchers
 
 LAUNCHER="srun -G 4 -N 1 -n ${num_processes}"
-#LAUNCHER="srun -G 8 -N 2 -n ${num_processes}"
+LAUNCHER="srun -G 8 -N 2 -n ${num_processes}"
 
 USE_DEEPSPEED=true  # Set to false to disable DeepSpeed
-USE_DEEPSPEED=false  # Set to false to disable DeepSpeed
+#USE_DEEPSPEED=false  # Set to false to disable DeepSpeed
 # Setup Finished
 
 PYTHON_CMD="python tba_gsm8k.py --config configs/${config}.yml \
