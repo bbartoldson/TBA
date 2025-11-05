@@ -1,11 +1,16 @@
 # Trajectory Balance with Asynchrony
 
-This is the official repository for the paper [*Trajectory Balance with Asynchrony: Decoupling Exploration and Learning for Fast, Scalable LLM Post-Training*](https://arxiv.org/pdf/2503.18929). 
+This is the official repository for the paper [*Trajectory Balance with Asynchrony: Decoupling Exploration and Learning for Fast, Scalable LLM Post-Training*](https://arxiv.org/pdf/2503.18929).
 
 Our async RL approach speeds up various LLM post-training pipelines (GSM8K, TL;DR, red-teaming). You can use the code here to reproduce results like the following.
 
-![Screenshot 2025-04-09 at 12 40 30 PM](https://github.com/user-attachments/assets/c19e3548-072d-4e2c-b040-4d8e2021a5c2)
+![Screenshot 2025-04-09 at 12 40 30 PM](https://github.com/user-attachments/assets/c19e3548-072d-4e2c-b040-4d8e2021a5c2)
 
+## TBA′
+
+**TBA′** is our TBA implementation for larger-scale training with 7+ billion parameter models, with evaluation on MATH 500 and reasoning gym tasks.
+
+For the TBA′ code, visit the [TBA-prime repository](https://github.com/bbartoldson/TBA-prime).
 
 # Setup
 
@@ -13,7 +18,7 @@ Install the necessary requirements.
 
 ```pip install -r requirements.txt```
 
-To exactly reproduce our results, please use a 4xA100 (80 GB) node. 
+To exactly reproduce our results, please use a 4xA100 (80 GB) node.
 
 If you have different hardware, just modify the relevant arguments in one of the launch scripts. For example, with `launch_training_gsm8k.sh`,
 
@@ -35,7 +40,7 @@ To launch a TL;DR experiment, run the following command.
 
 # Evaluating Results
 
-The GSM8K test performance will be generated automatically at the end of the training script. 
+The GSM8K test performance will be generated automatically at the end of the training script.
 
 For TL;DR, we leverage the post-training evaluation pipeline of Noukhovitch et al. (2025). To evaluate a trained model, use the following 2 steps.
 
